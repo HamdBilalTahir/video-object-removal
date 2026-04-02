@@ -1,0 +1,22 @@
+# Models and weights
+transformer/
+vae/
+scheduler/
+gradio_demo/model/
+gradio_demo/SAM2-Video-Predictor/
+gradio_demo/sam2/SAM2-Video-Predictor/
+
+# Storage
+storage/
+gradio_demo/storage/
+
+# Virtual environments
+minimaxvenv/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
