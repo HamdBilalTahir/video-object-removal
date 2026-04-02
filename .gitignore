@@ -2,6 +2,7 @@
 transformer/
 vae/
 scheduler/
+SAM2-Video-Predictor/
 gradio_demo/model/
 gradio_demo/SAM2-Video-Predictor/
 gradio_demo/sam2/SAM2-Video-Predictor/

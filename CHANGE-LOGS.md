@@ -13,6 +13,17 @@
 > - **Files:**
 >   - `README.md`
 
+### 🔧 DevOps / Build
+
+---
+
+> ### Add root SAM2-Video-Predictor to gitignore
+>
+> - **What changed:** Added `SAM2-Video-Predictor/` to the root `.gitignore` file.
+> - **Why:** Prevents accidentally committing the large downloaded SAM2 model checkpoints from the root directory.
+> - **Files:**
+>   - `.gitignore`
+
 ### 🐛 Fixes
 
 ---
