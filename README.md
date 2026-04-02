@@ -70,6 +70,7 @@ The easiest way to interact with the tracking and removal pipeline using the LaM
 
 1. Install dependencies:
 ```bash
+python3 -m venv minimaxvenv
 pip install -r requirements.txt
 ```
 

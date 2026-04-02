@@ -272,12 +272,22 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
     final_clip = original_clip.fl(fl_make_frame, apply_to=["video"])
 
     progress(0.95, desc="Encoding video...")
+    video_file_tmp = f"{STORAGE_DIR}/{time.time()}-{random.random()}-tmp.mp4"
     video_file = f"{STORAGE_DIR}/{time.time()}-{random.random()}-removed_output.mp4"
-    final_clip.write_videofile(video_file, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+    
+    # Use -crf 18 for visually lossless video, audio=False because we will mux original audio
+    final_clip.write_videofile(video_file_tmp, codec='libx264', audio=False, ffmpeg_params=["-crf", "18"], verbose=False, logger=None)
     
     original_clip.close()
     final_clip.close()
     
+    progress(0.98, desc="Muxing original audio...")
+    # Directly copy audio stream from original video to preserve exact audio quality
+    os.system(f"ffmpeg -y -i {video_file_tmp} -i {video_path} -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? {video_file}")
+    
+    if os.path.exists(video_file_tmp):
+        os.remove(video_file_tmp)
+        
     progress(1.0, desc="Done!")
     return video_file
 
@@ -394,7 +404,7 @@ def track_video(start_time, end_time, video_state, progress=gr.Progress()):
     progress(0.95, desc="Encoding video...")
     video_file = f"{STORAGE_DIR}/{time.time()}-{random.random()}-tracked_output.mp4"
     clip = ImageSequenceClip(output_frames, fps=fps)
-    clip.write_videofile(video_file, codec='libx264', audio=False, verbose=False, logger=None)
+    clip.write_videofile(video_file, codec='libx264', audio=False, ffmpeg_params=["-crf", "18"], verbose=False, logger=None)
     progress(1.0, desc="Done!")
     return video_file
 
@@ -444,13 +454,17 @@ with gr.Blocks() as demo:
         
         def on_upload_copy(vp):
             if not vp:
-                return None
+                return gr.update()
             
-            abs_storage = os.path.abspath(STORAGE_DIR)
-            vp_abs = os.path.abspath(vp)
+            # Using realpath to avoid macOS /private symlink mismatches
+            abs_storage = os.path.realpath(STORAGE_DIR)
+            vp_abs = os.path.realpath(vp)
             
+            # Break infinite loop if already in storage or if it's an example
             if vp_abs.startswith(abs_storage) or "cartoon" in vp or "normal_videos" in vp:
-                return vp
+                # We return gr.update() to skip updating the component, completely breaking the infinite loop
+                return gr.update()
+                
             name = os.path.basename(vp)
             new_path = os.path.join(STORAGE_DIR, f"{int(time.time())}_{name}")
             shutil.copy2(vp, new_path)
@@ -543,10 +557,22 @@ with gr.Blocks() as demo:
             border-radius: 4px !important;
         }
         input[type=range]::-webkit-slider-thumb {
-            width: 20px !important;
-            height: 20px !important;
-            margin-top: -6px !important;
-            border-radius: 50% !important;
+            width: 10px !important;
+            height: 28px !important;
+            margin-top: -10px !important;
+            border-radius: 3px !important;
+            background: white !important;
+            border: 1px solid #ccc !important;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important;
+            cursor: pointer !important;
+        }
+        input[type=range]::-moz-range-thumb {
+            width: 10px !important;
+            height: 28px !important;
+            border-radius: 3px !important;
+            background: white !important;
+            border: 1px solid #ccc !important;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important;
             cursor: pointer !important;
         }
         """
@@ -642,4 +668,4 @@ with gr.Blocks() as demo:
         clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
         track_btn.click(track_video, inputs=[start_time_slider, end_time_slider, video_state], outputs=video_output)
 
-demo.launch(server_name="0.0.0.0", server_port=8000, allowed_paths=["/tmp", STORAGE_DIR])
+demo.launch(server_name="0.0.0.0", server_port=8000, allowed_paths=["/tmp", STORAGE_DIR], share=True)
