@@ -47,6 +47,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def get_lama_and_predictors():
     lama = LaMa(device=torch.device(device))
 
+    try:
+        from iopaint.model import LaMaONNX
+        lama_onnx = LaMaONNX(device=torch.device("cpu"))
+    except Exception:
+        lama_onnx = None
+
     sam2_checkpoint = "./SAM2-Video-Predictor/checkpoints/sam2_hiera_large.pt"
     config = "sam2_hiera_l.yaml"
 
@@ -55,9 +61,14 @@ def get_lama_and_predictors():
     model.image_size = 1024
     image_predictor = SAM2ImagePredictor(sam_model=model)
 
-    return lama, image_predictor, video_predictor
+    return lama, lama_onnx, image_predictor, video_predictor
 
 def get_video_info(video_path, current_time, video_state):
+    # Prefer the durable storage copy set by on_upload_copy over the Gradio temp path,
+    # which may be cleaned up before or during long operations.
+    video_path = video_state.get("video_path") or video_path
+    if not video_path or not os.path.isfile(video_path):
+        return None
     video_state["input_points"] = []
     video_state["scaled_points"] = []
     video_state["input_labels"] = []
@@ -145,7 +156,7 @@ def clear_clicks(video_state):
 
 from moviepy.editor import VideoFileClip
 
-def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, progress=gr.Progress()):
+def inference_and_return_video(dilation_iterations, inpaint_mode, telea_radius, video_state=None, progress=gr.Progress()):
     if video_state["origin_images"] is None or video_state["masks"] is None:
         return None, gr.update(interactive=False)
     if len(video_state["origin_images"]) == 1 and video_state.get("start_frame") is None:
@@ -154,7 +165,7 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
     images = video_state["origin_images"]
     masks = video_state["masks"]
     total = len(images)
-    
+
     video_path = video_state["video_path"]
     start_frame = video_state["start_frame"]
     end_frame = video_state["end_frame"]
@@ -163,59 +174,57 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
     fps = video_state["fps"]
 
     output_frames = []
-    
-    if use_gpu:
+
+    if inpaint_mode == "GPU (MiniMax-Remover)":
         progress(0.1, desc="Loading MiniMax-Remover pipeline (GPU)...")
         try:
             from diffusers.models import AutoencoderKLWan
             from transformer_minimax_remover import Transformer3DModel
             from diffusers.schedulers import UniPCMultistepScheduler
             from pipeline_minimax_remover import Minimax_Remover_Pipeline
-            
+
             vae = AutoencoderKLWan.from_pretrained("../vae", torch_dtype=torch.float16)
             transformer = Transformer3DModel.from_pretrained("../transformer", torch_dtype=torch.float16)
             scheduler = UniPCMultistepScheduler.from_pretrained("../scheduler")
-            
+
             pipe = Minimax_Remover_Pipeline(
                 vae=vae, transformer=transformer, scheduler=scheduler, torch_dtype=torch.float16
             ).to("cuda:0")
-            
+
             progress(0.3, desc="Running MiniMax-Remover (GPU)...")
-            
-            # images expects values in [-1, 1], and shape (T, H, W, C)
+
             images_tensor = (torch.from_numpy(np.array(images)).float() / 127.5) - 1.0
-            
-            # mask needs shape (T, H, W, 1) and in [0, 1]
+
             mask_list = []
             for m in masks:
                 if m.ndim == 3:
                     m = m[:, :, 0]
-                # apply dilation
                 kernel = np.ones((dilation_iterations * 2 + 1, dilation_iterations * 2 + 1), np.uint8)
                 m_uint8 = (m > 0.5).astype(np.uint8)
                 m_dilated = cv2.dilate(m_uint8, kernel, iterations=1)
                 mask_list.append(m_dilated)
-                
+
             masks_tensor = torch.from_numpy(np.array(mask_list)).float()
             if masks_tensor.ndim == 3:
                 masks_tensor = masks_tensor.unsqueeze(-1)
-                
+
             result_frames = pipe(
-                images=images_tensor, 
-                masks=masks_tensor, 
-                num_frames=len(images), 
-                height=original_height, 
-                width=original_width, 
-                num_inference_steps=12, 
-                generator=torch.Generator(device="cuda:0").manual_seed(42), 
-                iterations=0 # already dilated above
+                images=images_tensor,
+                masks=masks_tensor,
+                num_frames=len(images),
+                height=original_height,
+                width=original_width,
+                num_inference_steps=12,
+                generator=torch.Generator(device="cuda:0").manual_seed(42),
+                iterations=0
             ).frames[0]
-            
+
             output_frames = [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) if hasattr(cv2, "COLOR_RGB2BGR") else f for f in result_frames]
-            
+
         except Exception as e:
             gr.Warning(f"Failed to run GPU pipeline: {str(e)}. Make sure weights are downloaded to the root directory.")
             return None
+
     else:
         lama_config = InpaintRequest(
             hd_strategy=HDStrategy.ORIGINAL,
@@ -225,24 +234,31 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
         )
 
         for i, (img, msk) in enumerate(zip(images, masks)):
-            progress(i / total, desc=f"Inpainting frame {i+1}/{total} (CPU)...")
-            # img: uint8 RGB (H,W,3), msk: float32 (H,W) or (H,W,C)
+            progress(i / total, desc=f"Inpainting frame {i+1}/{total} ({inpaint_mode})...")
             img_uint8 = img.astype(np.uint8)
             if msk.ndim == 3:
                 msk = msk[:, :, 0]
-            
-            # Ensure mask is float32
             msk = msk.astype(np.float32)
 
-            # Dilate mask
             kernel = np.ones((dilation_iterations * 2 + 1, dilation_iterations * 2 + 1), np.uint8)
             msk_uint8 = (msk > 0.5).astype(np.uint8) * 255
             msk_uint8 = msk_uint8.astype(np.uint8)
             msk_uint8 = cv2.dilate(msk_uint8, kernel, iterations=1)
-            result = lama_model(img_uint8, msk_uint8, lama_config)
-            # LaMa returns float64 BGR, so convert to uint8 RGB for ImageSequenceClip
-            result = np.clip(result, 0, 255).astype(np.uint8)
-            result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+
+            if inpaint_mode in ("Fast (OpenCV Telea)", "Fast (OpenCV NS)"):
+                flag = cv2.INPAINT_TELEA if inpaint_mode == "Fast (OpenCV Telea)" else cv2.INPAINT_NS
+                # img_uint8 is RGB; cv2.inpaint is channel-agnostic so result is also RGB — no conversion needed
+                result = cv2.inpaint(img_uint8, msk_uint8, inpaintRadius=int(telea_radius), flags=flag)
+            elif inpaint_mode == "LaMa ONNX (faster CPU)" and lama_onnx_model is not None:
+                result = lama_onnx_model(img_uint8, msk_uint8, lama_config)
+                result = np.clip(result, 0, 255).astype(np.uint8)
+                result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+            else:
+                # Default: LaMa (PyTorch)
+                result = lama_model(img_uint8, msk_uint8, lama_config)
+                result = np.clip(result, 0, 255).astype(np.uint8)
+                result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+
             output_frames.append(result)
 
     progress(0.85, desc="Stitching full video...")
@@ -283,7 +299,7 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
     
     progress(0.98, desc="Muxing original audio...")
     # Directly copy audio stream from original video to preserve exact audio quality
-    os.system(f"ffmpeg -y -i {video_file_tmp} -i {video_path} -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? {video_file}")
+    os.system(f'ffmpeg -y -i "{video_file_tmp}" -i "{video_path}" -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? "{video_file}"')
     
     if os.path.exists(video_file_tmp):
         os.remove(video_file_tmp)
@@ -293,7 +309,7 @@ def inference_and_return_video(dilation_iterations, use_gpu, video_state=None, p
 
 
 def get_video_duration(video_path):
-    if video_path is None:
+    if video_path is None or not os.path.isfile(video_path):
         return gr.update(), gr.update(), "<p style='color:#aaa'>No video loaded.</p>"
     vr = VideoReader(video_path, ctx=cpu(0))
     fps = vr.get_avg_fps()
@@ -326,16 +342,12 @@ def _build_ruler_html(duration):
     )
 
 
-def track_video(start_time, end_time, video_state, progress=gr.Progress()):
+def track_video(start_time, end_time, is_static, video_state, progress=gr.Progress()):
     if video_state["origin_images"] is None or video_state["masks"] is None:
         gr.Warning("Please complete target segmentation on the first frame first, then click Tracking")
         return None
 
-    input_points = video_state["input_points"]
-    input_labels = video_state["input_labels"]
-    frame_idx = video_state["frame_idx"]
     obj_id = video_state["obj_id"]
-    scaled_points = video_state["scaled_points"]
 
     progress(0, desc="Loading video frames...")
     vr = VideoReader(video_state["video_path"], ctx=cpu(0))
@@ -361,45 +373,65 @@ def track_video(start_time, end_time, video_state, progress=gr.Progress()):
     video_state["fps"] = fps
     video_state["original_height"] = height
     video_state["original_width"] = width
-    images = np.array(images)
 
-    progress(0.2, desc="Initialising SAM2 tracker...")
-    inference_state = video_predictor.init_state(images=images/255, device=device)
-    video_state["inference_state"] = inference_state
-
-    if len(torch.from_numpy(video_state["masks"][0]).shape) == 3:
-        mask = torch.from_numpy(video_state["masks"][0])[:,:,0]
-    else:
-        mask = torch.from_numpy(video_state["masks"][0])
-
-    video_predictor.add_new_mask(
-        inference_state=inference_state,
-        frame_idx=0,
-        obj_id=obj_id,
-        mask=mask
-    )
-
-    output_frames = []
-    mask_frames = []
-    total_frames = len(images)
     color = np.array(COLOR_PALETTE[int(time.time()) % len(COLOR_PALETTE)], dtype=np.float32) / 255.0
     color = color[None, None, :]
-    progress(0.3, desc=f"Tracking {total_frames} frames...")
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        frame = images[out_frame_idx].astype(np.float32) / 255.0
-        mask = np.zeros((H, W, 3), dtype=np.float32)
-        for i, logit in enumerate(out_mask_logits):
-            out_mask = logit.cpu().squeeze().detach().numpy()
-            out_mask = (out_mask[:,:,None] > 0).astype(np.float32)
-            mask += out_mask
-        mask = np.clip(mask, 0, 1)
-        mask = cv2.resize(mask, (W_, H_))
-        mask_frames.append(mask)
-        painted = (1 - mask * 0.5) * frame + mask * 0.5 * color
-        painted = np.uint8(np.clip(painted * 255, 0, 255))
-        output_frames.append(painted)
-        progress(0.3 + 0.6 * (out_frame_idx + 1) / total_frames,
-                 desc=f"Tracking frame {out_frame_idx + 1}/{total_frames}...")
+    total_frames = len(images)
+    output_frames = []
+    mask_frames = []
+
+    if is_static:
+        # Object doesn't move — tile the frame-0 mask across every frame, skip SAM2 entirely
+        progress(0.2, desc="Static object: tiling frame-0 mask across all frames...")
+        base_mask = video_state["masks"][0]
+        if base_mask.ndim == 3:
+            base_mask = base_mask[:, :, 0:1]  # keep (H, W, 1)
+        else:
+            base_mask = base_mask[:, :, None]
+        base_mask_3ch = np.repeat(base_mask, 3, axis=2).astype(np.float32)
+
+        for idx, img in enumerate(images):
+            progress(0.2 + 0.75 * (idx + 1) / total_frames,
+                     desc=f"Compositing frame {idx + 1}/{total_frames}...")
+            frame = img.astype(np.float32) / 255.0
+            mask_frames.append(base_mask_3ch)
+            painted = (1 - base_mask_3ch * 0.5) * frame + base_mask_3ch * 0.5 * color
+            output_frames.append(np.uint8(np.clip(painted * 255, 0, 255)))
+    else:
+        images_arr = np.array(images)
+        progress(0.2, desc="Initialising SAM2 tracker...")
+        inference_state = video_predictor.init_state(images=images_arr / 255, device=device)
+        video_state["inference_state"] = inference_state
+
+        if len(torch.from_numpy(video_state["masks"][0]).shape) == 3:
+            mask = torch.from_numpy(video_state["masks"][0])[:, :, 0]
+        else:
+            mask = torch.from_numpy(video_state["masks"][0])
+
+        video_predictor.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=0,
+            obj_id=obj_id,
+            mask=mask
+        )
+
+        progress(0.3, desc=f"Tracking {total_frames} frames...")
+        for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+            frame = images_arr[out_frame_idx].astype(np.float32) / 255.0
+            mask = np.zeros((H, W, 3), dtype=np.float32)
+            for i, logit in enumerate(out_mask_logits):
+                out_mask = logit.cpu().squeeze().detach().numpy()
+                out_mask = (out_mask[:, :, None] > 0).astype(np.float32)
+                mask += out_mask
+            mask = np.clip(mask, 0, 1)
+            mask = cv2.resize(mask, (W_, H_))
+            mask_frames.append(mask)
+            painted = (1 - mask * 0.5) * frame + mask * 0.5 * color
+            painted = np.uint8(np.clip(painted * 255, 0, 255))
+            output_frames.append(painted)
+            progress(0.3 + 0.6 * (out_frame_idx + 1) / total_frames,
+                     desc=f"Tracking frame {out_frame_idx + 1}/{total_frames}...")
+
     video_state["masks"] = mask_frames
     progress(0.95, desc="Encoding video...")
     video_file = f"{STORAGE_DIR}/{time.time()}-{random.random()}-tracked_output.mp4"
@@ -407,6 +439,68 @@ def track_video(start_time, end_time, video_state, progress=gr.Progress()):
     clip.write_videofile(video_file, codec='libx264', audio=False, ffmpeg_params=["-crf", "18"], verbose=False, logger=None)
     progress(1.0, desc="Done!")
     return video_file
+
+def load_tracked_video(original_path, tracked_path, video_state, progress=gr.Progress()):
+    original_path = video_state.get("video_path") or original_path
+    if not original_path or not os.path.isfile(original_path):
+        gr.Warning("Please upload the original video first.")
+        return None, video_state
+    if not tracked_path or not os.path.isfile(tracked_path):
+        gr.Warning("Please upload the previously tracked video.")
+        return None, video_state
+
+    progress(0, desc="Reading original video frames...")
+    vr_orig = VideoReader(original_path, ctx=cpu(0))
+    fps = vr_orig.get_avg_fps()
+    orig_frames = [vr_orig[i].asnumpy() for i in range(len(vr_orig))]
+    del vr_orig
+
+    progress(0.1, desc="Reading tracked video frames...")
+    vr_tracked = VideoReader(tracked_path, ctx=cpu(0))
+    tracked_frames = [vr_tracked[i].asnumpy() for i in range(len(vr_tracked))]
+    del vr_tracked
+
+    n = min(len(orig_frames), len(tracked_frames))
+    height, width = orig_frames[0].shape[:2]
+
+    if orig_frames[0].shape[0] > orig_frames[0].shape[1]:
+        W_ = W
+        H_ = int(W_ * height / width)
+    else:
+        H_ = H
+        W_ = int(H_ * width / height)
+
+    progress(0.2, desc="Extracting masks from diff...")
+    mask_frames = []
+    images_resized = []
+    for i in range(n):
+        progress(0.2 + 0.7 * i / n, desc=f"Processing frame {i+1}/{n}...")
+        orig = cv2.resize(orig_frames[i].astype(np.uint8), (W_, H_))
+        tracked = cv2.resize(tracked_frames[i].astype(np.uint8), (W_, H_))
+
+        # Diff in grayscale — overlay pixels differ from original
+        orig_gray = cv2.cvtColor(orig, cv2.COLOR_RGB2GRAY).astype(np.int16)
+        tracked_gray = cv2.cvtColor(tracked, cv2.COLOR_RGB2GRAY).astype(np.int16)
+        diff = np.abs(orig_gray - tracked_gray).astype(np.uint8)
+
+        # Threshold: any pixel that changed by more than 15 counts as masked
+        _, mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+        mask = mask.astype(np.float32) / 255.0
+        mask_frames.append(mask)
+        images_resized.append(orig)
+
+    video_state["masks"] = mask_frames
+    video_state["origin_images"] = images_resized
+    video_state["start_frame"] = 0
+    video_state["end_frame"] = n
+    video_state["fps"] = fps
+    video_state["original_height"] = height
+    video_state["original_width"] = width
+
+    progress(1.0, desc="Done! Click Remove to proceed.")
+    gr.Info(f"Loaded {n} frames with masks extracted from tracked video. Click Remove to proceed.")
+    return tracked_path, video_state
+
 
 text = """
 <div style='text-align:center; font-size:32px; font-family: Arial, Helvetica, sans-serif;'>
@@ -428,7 +522,7 @@ text = """
 </div>
 """
 
-lama_model, image_predictor, video_predictor = get_lama_and_predictors()
+lama_model, lama_onnx_model, image_predictor, video_predictor = get_lama_and_predictors()
 
 with gr.Blocks() as demo:
     video_state = gr.State({
@@ -445,6 +539,8 @@ with gr.Blocks() as demo:
     })
     gr.Markdown(f"<div style='text-align:center;'>{text}</div>")
 
+    reset_btn = gr.Button("Reset", elem_id="reset-btn", variant="stop")
+
     with gr.Column():
         video_input = gr.Video(
             label="Upload Video",
@@ -452,25 +548,32 @@ with gr.Blocks() as demo:
             height=300
         )
         
-        def on_upload_copy(vp):
-            if not vp:
-                return gr.update()
-            
-            # Using realpath to avoid macOS /private symlink mismatches
-            abs_storage = os.path.realpath(STORAGE_DIR)
-            vp_abs = os.path.realpath(vp)
-            
-            # Break infinite loop if already in storage or if it's an example
-            if vp_abs.startswith(abs_storage) or "cartoon" in vp or "normal_videos" in vp:
-                # We return gr.update() to skip updating the component, completely breaking the infinite loop
-                return gr.update()
-                
-            name = os.path.basename(vp)
-            new_path = os.path.join(STORAGE_DIR, f"{int(time.time())}_{name}")
-            shutil.copy2(vp, new_path)
-            return new_path
-        
-        video_input.change(fn=on_upload_copy, inputs=[video_input], outputs=[video_input])
+        def on_upload_copy(vp, vs):
+            if not vp or not os.path.isfile(vp):
+                return gr.update(), vs
+
+            try:
+                abs_storage = os.path.realpath(STORAGE_DIR)
+                vp_abs = os.path.realpath(vp)
+
+                if vp_abs.startswith(abs_storage) or "cartoon" in vp or "normal_videos" in vp:
+                    # Already a durable path — make sure video_state knows it
+                    vs["video_path"] = vp
+                    return gr.update(), vs
+
+                name = os.path.basename(vp)
+                new_path = os.path.join(STORAGE_DIR, f"{int(time.time())}_{name}")
+                shutil.copy2(vp, new_path)
+                # Store the durable storage path so downstream functions never reference
+                # the Gradio temp path (which gets cleaned up during long operations).
+                vs["video_path"] = new_path
+            except Exception:
+                pass
+            # Always return gr.update() so the component keeps pointing to Gradio's
+            # managed temp path, which passes Gradio's internal upload-folder validation.
+            return gr.update(), vs
+
+        video_input.change(fn=on_upload_copy, inputs=[video_input, video_state], outputs=[video_input, video_state])
         gr.Markdown(
             "<div style='text-align:center;color:#aaa;font-size:12px'>"
             "📌 <b>How to use:</b> Upload a video → pause at the frame with the object → click <i>Extract Current Frame</i> → click the object in the image → adjust Start/End time → click <i>Tracking</i> → click <i>Remove</i>"
@@ -530,6 +633,11 @@ with gr.Blocks() as demo:
             width: 60% !important;
             margin: 0 auto;
         }
+        #reset-btn {
+            width: 60% !important;
+            margin: 8px auto !important;
+            display: block !important;
+        }
         #my-btn2 button {
             width: 120px !important;
             max-width: 120px !important;
@@ -585,21 +693,47 @@ with gr.Blocks() as demo:
             )
             clear_btn = gr.Button("Clear All Clicks")
 
-        timeline_ruler = gr.HTML("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", elem_id="my-btn")
-        with gr.Row(elem_id="my-btn"):
-            start_time_slider = gr.Slider(
-                minimum=0, maximum=60, value=0, step=0.5,
-                label="Start Time (s)",
-                info="The second in the video where tracking begins. The object mask from the extracted frame is propagated forward from this point. Earlier start = more frames to process = slower & more RAM."
-            )
-            end_time_slider = gr.Slider(
-                minimum=0, maximum=60, value=10, step=0.5,
-                label="End Time (s)",
-                info="The second in the video where tracking stops. Shorter ranges (fewer seconds between start and end) are faster and use less RAM. Each extra second at 30fps adds ~30 frames to track."
-            )
-        with gr.Row(elem_id="my-btn"):
-            track_btn = gr.Button("Tracking")
+        use_tracked_checkbox = gr.Checkbox(
+            label="Use previously tracked video instead of tracking",
+            value=False,
+            elem_id="my-btn"
+        )
+
+        with gr.Column(visible=True) as tracking_section:
+            timeline_ruler = gr.HTML("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", elem_id="my-btn")
+            with gr.Row(elem_id="my-btn"):
+                start_time_slider = gr.Slider(
+                    minimum=0, maximum=60, value=0, step=0.5,
+                    label="Start Time (s)",
+                    info="The second in the video where tracking begins. The object mask from the extracted frame is propagated forward from this point. Earlier start = more frames to process = slower & more RAM."
+                )
+                end_time_slider = gr.Slider(
+                    minimum=0, maximum=60, value=10, step=0.5,
+                    label="End Time (s)",
+                    info="The second in the video where tracking stops. Shorter ranges (fewer seconds between start and end) are faster and use less RAM. Each extra second at 30fps adds ~30 frames to track."
+                )
+            with gr.Row(elem_id="my-btn"):
+                track_btn = gr.Button("Tracking")
+                static_object_checkbox = gr.Checkbox(
+                    label="Static Object",
+                    value=False,
+                    info="Check if the object doesn't move in the video. Skips SAM2 tracking entirely and tiles the frame-0 mask across all frames — near-instant."
+                )
+
+        with gr.Column(visible=False) as upload_tracked_section:
+            tracked_video_upload = gr.Video(label="Previously Tracked Video", elem_id="my-video", height=200)
+            load_tracked_btn = gr.Button("Load Tracked Video", elem_id="my-btn")
+
         video_output = gr.Video(label="Tracking Result", elem_id="my-video", height=300)
+
+        def toggle_tracking_mode(use_tracked):
+            return gr.update(visible=not use_tracked), gr.update(visible=use_tracked)
+
+        use_tracked_checkbox.change(
+            toggle_tracking_mode,
+            inputs=[use_tracked_checkbox],
+            outputs=[tracking_section, upload_tracked_section]
+        )
 
         with gr.Column(elem_id="my-btn"):
             dilation_slider = gr.Slider(
@@ -609,36 +743,38 @@ with gr.Blocks() as demo:
             )
 
         with gr.Row(elem_id="my-btn"):
-            use_gpu_checkbox = gr.Checkbox(label="Use GPU (MiniMax-Remover Pipeline)", value=False, info="Uncheck to use the CPU-friendly LaMa fallback.")
+            inpaint_mode_dropdown = gr.Dropdown(
+                choices=["LaMa (PyTorch)", "LaMa ONNX (faster CPU)", "Fast (OpenCV Telea)", "Fast (OpenCV NS)", "GPU (MiniMax-Remover)"],
+                value="LaMa (PyTorch)",
+                label="Inpainting Mode",
+                info="LaMa (PyTorch): best CPU quality, good for any background. LaMa ONNX: same quality as LaMa, ~2-4x faster on CPU. OpenCV Telea: instant, best for thin/small objects on uniform backgrounds. OpenCV NS: slightly better than Telea for larger objects, still instant. GPU (MiniMax-Remover): highest quality overall, requires CUDA."
+            )
+        with gr.Column(elem_id="my-btn", visible=False) as telea_options:
+            telea_radius_slider = gr.Slider(
+                minimum=1, maximum=40, value=15, step=1,
+                label="OpenCV Inpaint Radius",
+                info="Only applies to OpenCV Telea and NS modes. Larger values sample from a wider neighbourhood — helps with bigger objects but can blur edges. Try 10–20 for mic-sized objects."
+            )
+
+        def toggle_telea_options(mode):
+            return gr.update(visible=(mode in ("Fast (OpenCV Telea)", "Fast (OpenCV NS)")))
+
+        inpaint_mode_dropdown.change(
+            toggle_telea_options,
+            inputs=[inpaint_mode_dropdown],
+            outputs=[telea_options]
+        )
         remove_btn = gr.Button("Remove", elem_id="my-btn")
         remove_video = gr.Video(label="Remove Results", elem_id="my-video", height=300)
         
         with gr.Row(elem_id="my-btn"):
             download_btn = gr.DownloadButton("Download Output Video", interactive=False)
         
-        # Load state from localStorage on page load
-        js_load = """
-        async () => {
-            try {
-                const up = JSON.parse(localStorage.getItem('minimax_up'));
-                const tr = JSON.parse(localStorage.getItem('minimax_tr'));
-                const rm = JSON.parse(localStorage.getItem('minimax_rm'));
-                return [up || null, tr || null, rm || null];
-            } catch(e) {
-                return [null, null, null];
-            }
-        }
-        """
-        demo.load(fn=None, inputs=[], outputs=[video_input, video_output, remove_video], js=js_load)
-
-        # Save state to localStorage on change
-        js_save_up = "(val) => { if (val) localStorage.setItem('minimax_up', JSON.stringify(val)); else localStorage.removeItem('minimax_up'); }"
-        js_save_tr = "(val) => { if (val) localStorage.setItem('minimax_tr', JSON.stringify(val)); else localStorage.removeItem('minimax_tr'); }"
-        js_save_rm = "(val) => { if (val) localStorage.setItem('minimax_rm', JSON.stringify(val)); else localStorage.removeItem('minimax_rm'); }"
-        
-        video_input.change(fn=None, inputs=[video_input], outputs=[], js=js_save_up)
-        video_output.change(fn=None, inputs=[video_output], outputs=[], js=js_save_tr)
-        remove_video.change(fn=None, inputs=[remove_video], outputs=[], js=js_save_rm)
+        # localStorage restore is intentionally removed for all video components.
+        # Gradio validates every file path fed into a component against its internal
+        # temp dir (/tmp/gradio). Both upload paths (Gradio temp, cleaned on restart)
+        # and output paths (STORAGE_DIR) fail that check when restored from localStorage,
+        # causing a ValueError before any Python code runs.
         def enable_download(video):
             if video:
                 return gr.update(value=video, interactive=True)
@@ -646,7 +782,7 @@ with gr.Blocks() as demo:
 
         remove_btn.click(
             inference_and_return_video,
-            inputs=[dilation_slider, use_gpu_checkbox, video_state],
+            inputs=[dilation_slider, inpaint_mode_dropdown, telea_radius_slider, video_state],
             outputs=remove_video
         ).then(
             fn=enable_download,
@@ -666,6 +802,50 @@ with gr.Blocks() as demo:
         )
         image_output.select(fn=segment_frame, inputs=[point_prompt, video_state], outputs=image_output)
         clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
-        track_btn.click(track_video, inputs=[start_time_slider, end_time_slider, video_state], outputs=video_output)
+        track_btn.click(track_video, inputs=[start_time_slider, end_time_slider, static_object_checkbox, video_state], outputs=video_output)
+        load_tracked_btn.click(
+            load_tracked_video,
+            inputs=[video_input, tracked_video_upload, video_state],
+            outputs=[video_output, video_state]
+        )
 
-demo.launch(server_name="0.0.0.0", server_port=8000, allowed_paths=["/tmp", STORAGE_DIR], share=True)
+        def reset_all():
+            fresh_state = {
+                "origin_images": None,
+                "inference_state": None,
+                "masks": None,
+                "painted_images": None,
+                "video_path": None,
+                "input_points": [],
+                "scaled_points": [],
+                "input_labels": [],
+                "frame_idx": 0,
+                "obj_id": 1
+            }
+            return (
+                fresh_state,          # video_state
+                None,                 # video_input
+                None,                 # image_output
+                None,                 # video_output
+                None,                 # tracked_video_upload
+                None,                 # remove_video
+                gr.update(value=0, maximum=60),   # start_time_slider
+                gr.update(value=10, maximum=60),  # end_time_slider
+                "<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>",  # timeline_ruler
+                gr.update(interactive=False),     # download_btn
+                False,                # static_object_checkbox
+                False,                # use_tracked_checkbox
+                gr.update(visible=True),   # tracking_section
+                gr.update(visible=False),  # upload_tracked_section
+            )
+
+        reset_btn.click(
+            fn=reset_all,
+            inputs=[],
+            outputs=[video_state, video_input, image_output, video_output, tracked_video_upload, remove_video,
+                     start_time_slider, end_time_slider, timeline_ruler, download_btn, static_object_checkbox,
+                     use_tracked_checkbox, tracking_section, upload_tracked_section],
+            js="() => { localStorage.removeItem('minimax_tr'); localStorage.removeItem('minimax_rm'); }"
+        )
+
+demo.launch(server_name="0.0.0.0", server_port=8000, allowed_paths=["/tmp", os.path.abspath(STORAGE_DIR)], share=True)
