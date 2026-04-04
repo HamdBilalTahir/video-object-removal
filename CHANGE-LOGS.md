@@ -2,10 +2,76 @@
 
 ---
 
+### ✨ Features
+
+---
+
+> ### Add "Draw Mask" Selection Mode
+>
+> - **What changed:** Added a "Selection Mode" radio button giving users the choice to either "Click Points" (SAM2 AI tracking) or "Draw Mask" (manual painting). The manual drawing mode uses Gradio's interactive `ImageEditor` with a custom brush to extract binary alpha masks directly from user strokes.
+> - **Why:** Allows users to define perfectly customized, free-form masks to track and replace, eliminating dependence on SAM2's point click interpretations for difficult shapes.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Split App into Two Independent Tabs
+>
+> - **What changed:** Refactored the entire UI into two distinct tabs: "Remove Object" and "Replace Background". Each tab now has its own independent inputs, outputs, and state.
+> - **Why:** Provides a clearer separation of workflows right from the start, preventing user confusion about which mode (removal vs replacement) they are setting up.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Replace background with an image
+>
+> - **What changed:** Added an "Image Background" option alongside the video one, enabling users to upload a static background image and composite the masked region directly over the image across all frames.
+> - **Why:** Provides an easy way to replace tracked background elements with a custom static image without requiring a video background.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Replace background with another video
+>
+> - **What changed:** Added a "Video Background" option to the inpainting mode dropdown, a Background Video upload component, and the logic to composite the masked region with frames from the uploaded background video.
+> - **Why:** Allows users to easily perform green-screen style background replacement by tracking the background and replacing it with a new video sequence.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Apply solid background color to mask
+>
+> - **What changed:** Added a "Solid Color" option to the Inpainting Mode dropdown, a Color Picker, and a "Pick Color" click type that allows users to select a color directly from the uploaded video frame.
+> - **Why:** Gives users the ability to apply a chosen color directly over the object mask instead of using inpainting algorithms to remove it.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
 ### 🐛 Fixes
 
 ---
 
+> ### Fix ImageEditor rendering size and draw conflicts
+>
+> - **What changed:** Removed the `elem_id` from the ImageEditor to decouple it from CSS rules enforcing `object-fit: contain`, preventing mouse coordinate offsets during mask drawing. Also modified the custom zoom script to skip elements inside `.my-editor-class` to prevent intercepting drag events.
+> - **Why:** The component was shrinking visually while the drawing canvas coordinates remained unscaled, making it impossible to draw accurately. Zoom script interception also degraded interaction.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Align UI Component Dimensions
+>
+> - **What changed:** Added explicit CSS classes, DOM IDs, and `height` properties to the `Background Video` and `Background Image` components to ensure their dimensions perfectly mirror the rest of the layout components.
+> - **Why:** Background upload fields were previously rendering disproportionately large on the page and breaking layout consistency.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Fix Hydra GlobalHydra Already Initialized Error
+>
+> - **What changed:** Wrapped the `initialize` call in `gradio_demo/sam2/__init__.py` with a `GlobalHydra.instance().is_initialized()` check.
+> - **Why:** When Gradio auto-reloads the module on save, Hydra would crash attempting to initialize a GlobalHydra context that already existed.
+> - **Files:**
+>   - `gradio_demo/sam2/__init__.py`
+
+> ### Fix TypeError for Unsupported Video Attributes and Returns
+>
+> - **What changed:** Removed the `info` parameter from `gr.Video` (not supported in Gradio 4.21.0) and changed `inference_and_return_video` to properly return a single value rather than a tuple when handling validation errors.
+> - **Why:** The app was crashing on load due to `info` parameter mismatch, and throwing a TypeError internally when `gr.update` was unintentionally passed as a second variable to a single `remove_video` output.
+> - **Files:**
+>   - `gradio_demo/test.py`
 
 > ### Fix OpenCV Telea inpainting changing video colors
 >
@@ -24,6 +90,20 @@
 ### ✨ Features
 
 ---
+
+> ### Scroll and pinch-to-zoom on all video and image components
+>
+> - **What changed:** Injected a JavaScript zoom handler via `gr.HTML` that attaches to every `video` and image element on the page. Scrolling up/down zooms in/out centered on the pointer. Trackpad pinch-to-zoom (macOS `ctrlKey` wheel events) uses finer zoom steps for a natural feel. Double-click resets zoom to 1x. Overflow is clipped on the parent container so the zoomed element doesn't bleed into surrounding UI.
+> - **Why:** Allows inspecting fine details of tracking masks and removal results without zooming the whole browser page.
+> - **Files:**
+>   - `gradio_demo/test.py`
+
+> ### Add stop buttons for tracking and removal
+>
+> - **What changed:** Added a "Stop Tracking" button next to the Track button and a "Stop Removing" button next to the Remove button. Both are wired using Gradio's `cancels` mechanism to interrupt the running operation immediately.
+> - **Why:** Tracking and removal can take several minutes. Without a stop button the only option was to kill the server process.
+> - **Files:**
+>   - `gradio_demo/test.py`
 
 > ### Add OpenCV NS inpainting mode
 >

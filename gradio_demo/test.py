@@ -68,7 +68,7 @@ def get_video_info(video_path, current_time, video_state):
     # which may be cleaned up before or during long operations.
     video_path = video_state.get("video_path") or video_path
     if not video_path or not os.path.isfile(video_path):
-        return None
+        return None, None
     video_state["input_points"] = []
     video_state["scaled_points"] = []
     video_state["input_labels"] = []
@@ -93,13 +93,21 @@ def get_video_info(video_path, current_time, video_state):
     video_state["masks"] = None
     video_state["painted_images"] = None
     image = Image.fromarray(first_frame)
-    return image
+    return image, image
 
-def segment_frame(evt: gr.SelectData, label, video_state):
+def segment_frame(evt: gr.SelectData, label, video_state, current_mask_color):
     if video_state["origin_images"] is None:
         gr.Warning("Please click \"Extract First Frame\" to extract the first frame first, then click the annotation")
-        return None
+        return None, current_mask_color
     x, y = evt.index
+
+    if label == "Pick Color":
+        # Get color at x, y. origin_images[0] is RGB, y is row, x is col
+        pixel = video_state["origin_images"][0][y, x]
+        hex_color = f"#{pixel[0]:02x}{pixel[1]:02x}{pixel[2]:02x}"
+        current_img = video_state["painted_images"][0] if video_state["painted_images"] is not None else video_state["origin_images"][0]
+        return Image.fromarray(current_img), hex_color
+
     new_point = [x, y]
     label_value = 1 if label == "Positive" else 0
 
@@ -142,7 +150,7 @@ def segment_frame(evt: gr.SelectData, label, video_state):
         else:
             cv2.circle(painted_image, point, radius=3, color=(255, 0, 0), thickness=-1)
 
-    return Image.fromarray(painted_image)
+    return Image.fromarray(painted_image), current_mask_color
 
 def clear_clicks(video_state):
     video_state["input_points"] = []
@@ -156,12 +164,12 @@ def clear_clicks(video_state):
 
 from moviepy.editor import VideoFileClip
 
-def inference_and_return_video(dilation_iterations, inpaint_mode, telea_radius, video_state=None, progress=gr.Progress()):
+def inference_and_return_video(dilation_iterations, inpaint_mode, telea_radius, mask_color="#000000", bg_video_path=None, bg_image_path=None, video_state=None, progress=gr.Progress()):
     if video_state["origin_images"] is None or video_state["masks"] is None:
-        return None, gr.update(interactive=False)
+        return None
     if len(video_state["origin_images"]) == 1 and video_state.get("start_frame") is None:
-        gr.Warning("Please run 'Tracking' first before clicking 'Remove'!")
-        return None, gr.update(interactive=False)
+        gr.Warning("Please run 'Tracking' first before processing!")
+        return None
     images = video_state["origin_images"]
     masks = video_state["masks"]
     total = len(images)
@@ -175,7 +183,92 @@ def inference_and_return_video(dilation_iterations, inpaint_mode, telea_radius, 
 
     output_frames = []
 
-    if inpaint_mode == "GPU (MiniMax-Remover)":
+    if inpaint_mode == "Solid Color":
+        # Parse hex color to RGB tuple
+        hex_color = mask_color.lstrip('#')
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        color_arr = np.array(rgb, dtype=np.uint8)
+
+        for i, (img, msk) in enumerate(zip(images, masks)):
+            progress(i / total, desc=f"Processing frame {i+1}/{total} (Solid Color)...")
+            img_uint8 = img.astype(np.uint8)
+            if msk.ndim == 3:
+                msk = msk[:, :, 0]
+            msk = msk.astype(np.float32)
+
+            kernel = np.ones((dilation_iterations * 2 + 1, dilation_iterations * 2 + 1), np.uint8)
+            msk_uint8 = (msk > 0.5).astype(np.uint8)
+            msk_dilated = cv2.dilate(msk_uint8, kernel, iterations=1)
+
+            # Create solid color background for mask
+            mask_3ch = msk_dilated[:, :, None]
+            result = img_uint8 * (1 - mask_3ch) + color_arr * mask_3ch
+            result = result.astype(np.uint8)
+
+            output_frames.append(result)
+
+    elif inpaint_mode == "Video Background":
+        if not bg_video_path or not os.path.isfile(bg_video_path):
+            gr.Warning("Please upload a background video.")
+            return None
+
+        bg_vr = VideoReader(bg_video_path, ctx=cpu(0))
+        bg_len = len(bg_vr)
+        for i, (img, msk) in enumerate(zip(images, masks)):
+            progress(i / total, desc=f"Processing frame {i+1}/{total} (Video Background)...")
+            img_uint8 = img.astype(np.uint8)
+            if msk.ndim == 3:
+                msk = msk[:, :, 0]
+            msk = msk.astype(np.float32)
+
+            kernel = np.ones((dilation_iterations * 2 + 1, dilation_iterations * 2 + 1), np.uint8)
+            msk_uint8 = (msk > 0.5).astype(np.uint8)
+            msk_dilated = cv2.dilate(msk_uint8, kernel, iterations=1)
+            mask_3ch = msk_dilated[:, :, None]
+
+            # Get corresponding frame from background video
+            bg_idx = min(i, bg_len - 1)
+            bg_frame = bg_vr[bg_idx].asnumpy()
+            bg_frame_resized = cv2.resize(bg_frame, (img.shape[1], img.shape[0]))
+
+            result = img_uint8 * (1 - mask_3ch) + bg_frame_resized * mask_3ch
+            result = result.astype(np.uint8)
+
+            output_frames.append(result)
+        del bg_vr
+
+    elif inpaint_mode == "Image Background":
+        if not bg_image_path or not os.path.isfile(bg_image_path):
+            gr.Warning("Please upload a background image.")
+            return None
+
+        bg_img = cv2.imread(bg_image_path)
+        if bg_img is None:
+            gr.Warning("Failed to load background image.")
+            return None
+        bg_img = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
+
+        for i, (img, msk) in enumerate(zip(images, masks)):
+            progress(i / total, desc=f"Processing frame {i+1}/{total} (Image Background)...")
+            img_uint8 = img.astype(np.uint8)
+            if msk.ndim == 3:
+                msk = msk[:, :, 0]
+            msk = msk.astype(np.float32)
+
+            kernel = np.ones((dilation_iterations * 2 + 1, dilation_iterations * 2 + 1), np.uint8)
+            msk_uint8 = (msk > 0.5).astype(np.uint8)
+            msk_dilated = cv2.dilate(msk_uint8, kernel, iterations=1)
+            mask_3ch = msk_dilated[:, :, None]
+
+            # Resize background image to match current frame dimensions
+            bg_img_resized = cv2.resize(bg_img, (img.shape[1], img.shape[0]))
+
+            result = img_uint8 * (1 - mask_3ch) + bg_img_resized * mask_3ch
+            result = result.astype(np.uint8)
+
+            output_frames.append(result)
+
+    elif inpaint_mode == "GPU (MiniMax-Remover)":
         progress(0.1, desc="Loading MiniMax-Remover pipeline (GPU)...")
         try:
             from diffusers.models import AutoencoderKLWan
@@ -342,10 +435,44 @@ def _build_ruler_html(duration):
     )
 
 
-def track_video(start_time, end_time, is_static, video_state, progress=gr.Progress()):
-    if video_state["origin_images"] is None or video_state["masks"] is None:
-        gr.Warning("Please complete target segmentation on the first frame first, then click Tracking")
+def track_video(start_time, end_time, is_static, selection_mode, mask_data, video_state, progress=gr.Progress()):
+    if video_state["origin_images"] is None:
+        gr.Warning("Please extract a frame first")
         return None
+
+    if selection_mode == "Draw Mask":
+        if not mask_data:
+            gr.Warning("Please draw a mask on the image!")
+            return None
+            
+        import base64
+        import io
+        
+        try:
+            header, encoded = mask_data.split(",", 1)
+            data = base64.b64decode(encoded)
+            mask_pil = Image.open(io.BytesIO(data))
+            mask_np = np.array(mask_pil)
+            
+            if mask_np.shape[-1] == 4:
+                mask_2d = (mask_np[:, :, 3] > 0).astype(np.float32)
+            else:
+                mask_2d = (mask_np[:, :, 0] > 0).astype(np.float32)
+                
+            if mask_2d.sum() == 0:
+                gr.Warning("Please draw a mask on the image!")
+                return None
+                
+            height, width = video_state["origin_images"][0].shape[0:2]
+            mask_2d = cv2.resize(mask_2d, (width, height))
+            video_state["masks"] = np.expand_dims(mask_2d, axis=0)
+        except Exception as e:
+            gr.Warning("Failed to parse mask data.")
+            return None
+    else:
+        if video_state.get("masks") is None:
+            gr.Warning("Please complete target segmentation on the first frame first, then click Tracking")
+            return None
 
     obj_id = video_state["obj_id"]
 
@@ -524,328 +651,490 @@ text = """
 
 lama_model, lama_onnx_model, image_predictor, video_predictor = get_lama_and_predictors()
 
-with gr.Blocks() as demo:
-    video_state = gr.State({
-        "origin_images": None,
-        "inference_state": None,
-        "masks": None,  # Store user-generated masks
-        "painted_images": None,
-        "video_path": None,
-        "input_points": [],
-        "scaled_points": [],
-        "input_labels": [],
-        "frame_idx": 0,
-        "obj_id": 1
-    })
-    gr.Markdown(f"<div style='text-align:center;'>{text}</div>")
+def build_tab(tab_id, tab_label, inpaint_modes, btn_label, desc_info):
+    with gr.Tab(tab_label, id=tab_id):
+        video_state = gr.State({
+            "origin_images": None,
+            "inference_state": None,
+            "masks": None,
+            "painted_images": None,
+            "video_path": None,
+            "input_points": [],
+            "scaled_points": [],
+            "input_labels": [],
+            "frame_idx": 0,
+            "obj_id": 1
+        })
 
-    reset_btn = gr.Button("Reset", elem_id="reset-btn", variant="stop")
-
-    with gr.Column():
-        video_input = gr.Video(
-            label="Upload Video",
-            elem_id="my-video1",
-            height=300
-        )
-        
-        def on_upload_copy(vp, vs):
-            if not vp or not os.path.isfile(vp):
+        with gr.Column():
+            video_input = gr.Video(
+                label="Upload Video",
+                elem_id=f"my-video1-{tab_id}",
+                height=300
+            )
+            
+            def on_upload_copy(vp, vs):
+                if not vp or not os.path.isfile(vp):
+                    return gr.update(), vs
+                try:
+                    abs_storage = os.path.realpath(STORAGE_DIR)
+                    vp_abs = os.path.realpath(vp)
+                    if vp_abs.startswith(abs_storage) or "cartoon" in vp or "normal_videos" in vp:
+                        vs["video_path"] = vp
+                        return gr.update(), vs
+                    name = os.path.basename(vp)
+                    new_path = os.path.join(STORAGE_DIR, f"{int(time.time())}_{name}")
+                    shutil.copy2(vp, new_path)
+                    vs["video_path"] = new_path
+                except Exception:
+                    pass
                 return gr.update(), vs
 
-            try:
-                abs_storage = os.path.realpath(STORAGE_DIR)
-                vp_abs = os.path.realpath(vp)
+            video_input.change(fn=on_upload_copy, inputs=[video_input, video_state], outputs=[video_input, video_state])
+            gr.Markdown(f"<div style='text-align:center;color:#aaa;font-size:12px'>📌 <b>How to use:</b> {desc_info}</div>", elem_id="my-btn")
+            
+            current_time_box = gr.Number(value=0, visible=False)
+            get_info_btn = gr.Button("Extract Current Frame", elem_id="my-btn")
 
-                if vp_abs.startswith(abs_storage) or "cartoon" in vp or "normal_videos" in vp:
-                    # Already a durable path — make sure video_state knows it
-                    vs["video_path"] = vp
-                    return gr.update(), vs
-
-                name = os.path.basename(vp)
-                new_path = os.path.join(STORAGE_DIR, f"{int(time.time())}_{name}")
-                shutil.copy2(vp, new_path)
-                # Store the durable storage path so downstream functions never reference
-                # the Gradio temp path (which gets cleaned up during long operations).
-                vs["video_path"] = new_path
-            except Exception:
-                pass
-            # Always return gr.update() so the component keeps pointing to Gradio's
-            # managed temp path, which passes Gradio's internal upload-folder validation.
-            return gr.update(), vs
-
-        video_input.change(fn=on_upload_copy, inputs=[video_input, video_state], outputs=[video_input, video_state])
-        gr.Markdown(
-            "<div style='text-align:center;color:#aaa;font-size:12px'>"
-            "📌 <b>How to use:</b> Upload a video → pause at the frame with the object → click <i>Extract Current Frame</i> → click the object in the image → adjust Start/End time → click <i>Tracking</i> → click <i>Remove</i>"
-            "</div>",
-            elem_id="my-btn"
-        )
-        current_time_box = gr.Number(value=0, visible=False)
-        get_info_btn = gr.Button("Extract Current Frame", elem_id="my-btn")
-
-        gr.Examples(
-            examples=[
-                ["./cartoon/0.mp4"],
-                ["./cartoon/1.mp4"],
-                ["./cartoon/2.mp4"],
-                ["./cartoon/3.mp4"],
-                ["./cartoon/4.mp4"],
-                ["./normal_videos/0.mp4"],
-                ["./normal_videos/1.mp4"],
-                ["./normal_videos/3.mp4"],
-                ["./normal_videos/4.mp4"],
-                ["./normal_videos/5.mp4"],
-            ],
-            inputs=[video_input],
-            label="Choose a video to remove.",
-            elem_id="my-btn2"
-        )
-
-        image_output = gr.Image(label="First Frame Segmentation", interactive=True, elem_id="my-video", height=400)
-        demo.css = """
-        #my-btn {
-           width: 60% !important;
-           margin: 0 auto;
-        }
-
-        #my-video1 {
-           width: 60% !important;
-           max-height: 280px !important;
-           margin: 0 auto;
-        }
-        #my-video1 video {
-           max-height: 240px !important;
-           object-fit: contain !important;
-        }
-        #my-video {
-           width: 60% !important;
-           max-height: 320px !important;
-           margin: 0 auto;
-        }
-        #my-video video {
-           max-height: 260px !important;
-           object-fit: contain !important;
-        }
-        #my-md {
-           margin: 0 auto;
-        }
-        #my-btn2 {
-            width: 60% !important;
-            margin: 0 auto;
-        }
-        #reset-btn {
-            width: 60% !important;
-            margin: 8px auto !important;
-            display: block !important;
-        }
-        #my-btn2 button {
-            width: 120px !important;
-            max-width: 120px !important;
-            min-width: 120px !important;
-            height: 70px !important;
-            max-height: 70px !important;
-            min-height: 70px !important;
-            margin: 8px !important;
-            border-radius: 8px !important;
-            overflow: hidden !important;
-            white-space: normal !important;
-        }
-        /* Thicker, more interactive video scrubber */
-        video::-webkit-media-controls-timeline {
-            height: 10px !important;
-            padding: 0 !important;
-        }
-        .video-container input[type=range],
-        video ~ * input[type=range] {
-            height: 10px !important;
-            cursor: pointer !important;
-        }
-        input[type=range]::-webkit-slider-runnable-track {
-            height: 8px !important;
-            border-radius: 4px !important;
-        }
-        input[type=range]::-webkit-slider-thumb {
-            width: 10px !important;
-            height: 28px !important;
-            margin-top: -10px !important;
-            border-radius: 3px !important;
-            background: white !important;
-            border: 1px solid #ccc !important;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important;
-            cursor: pointer !important;
-        }
-        input[type=range]::-moz-range-thumb {
-            width: 10px !important;
-            height: 28px !important;
-            border-radius: 3px !important;
-            background: white !important;
-            border: 1px solid #ccc !important;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important;
-            cursor: pointer !important;
-        }
-        """
-        with gr.Row(elem_id="my-btn"):
-            point_prompt = gr.Radio(
-                ["Positive", "Negative"],
-                label="Click Type",
-                value="Positive",
-                info="Positive = click ON the object you want to remove. Negative = click on areas you do NOT want selected (useful to exclude accidentally selected regions)."
+            gr.Examples(
+                examples=[
+                    ["./cartoon/0.mp4"], ["./cartoon/1.mp4"], ["./cartoon/2.mp4"], ["./cartoon/3.mp4"], ["./cartoon/4.mp4"],
+                    ["./normal_videos/0.mp4"], ["./normal_videos/1.mp4"], ["./normal_videos/3.mp4"], ["./normal_videos/4.mp4"], ["./normal_videos/5.mp4"],
+                ],
+                inputs=[video_input],
+                label="Choose a video to process.",
+                elem_id="my-btn2"
             )
-            clear_btn = gr.Button("Clear All Clicks")
 
-        use_tracked_checkbox = gr.Checkbox(
-            label="Use previously tracked video instead of tracking",
-            value=False,
-            elem_id="my-btn"
-        )
-
-        with gr.Column(visible=True) as tracking_section:
-            timeline_ruler = gr.HTML("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", elem_id="my-btn")
             with gr.Row(elem_id="my-btn"):
-                start_time_slider = gr.Slider(
-                    minimum=0, maximum=60, value=0, step=0.5,
-                    label="Start Time (s)",
-                    info="The second in the video where tracking begins. The object mask from the extracted frame is propagated forward from this point. Earlier start = more frames to process = slower & more RAM."
+                selection_mode = gr.Radio(
+                    ["Click Points", "Draw Mask"],
+                    value="Click Points",
+                    label="Selection Mode",
+                    info="Choose 'Click Points' to use SAM2 AI tracking, or 'Draw Mask' to manually paint the area you want to track/replace."
                 )
-                end_time_slider = gr.Slider(
-                    minimum=0, maximum=60, value=10, step=0.5,
-                    label="End Time (s)",
-                    info="The second in the video where tracking stops. Shorter ranges (fewer seconds between start and end) are faster and use less RAM. Each extra second at 30fps adds ~30 frames to track."
+
+            image_output = gr.Image(label="First Frame Segmentation", interactive=True, elem_id="my-video", height=300)
+            image_editor = gr.Image(label="Draw Mask", interactive=False, elem_classes="my-editor-class", elem_id="my-editor-video", height=300, visible=False)
+            mask_data_input = gr.Textbox(visible=False, elem_id="mask-data-input")
+            
+            with gr.Row(elem_id="my-btn", visible=True) as clicks_row:
+                point_prompt = gr.Radio(
+                    ["Positive", "Negative", "Pick Color"],
+                    label="Click Type",
+                    value="Positive",
+                    info="Positive = click ON the object you want to remove. Negative = click on areas you do NOT want selected. Pick Color = click to pick a color for Solid Color mode."
                 )
+                clear_btn = gr.Button("Clear All Clicks")
+
+            def toggle_selection_mode(mode):
+                return (
+                    gr.update(visible=(mode == "Click Points")),
+                    gr.update(visible=(mode == "Draw Mask")),
+                    gr.update(visible=(mode == "Click Points"))
+                )
+            
+            selection_mode.change(
+                toggle_selection_mode,
+                inputs=[selection_mode],
+                outputs=[image_output, image_editor, clicks_row]
+            )
+
+            use_tracked_checkbox = gr.Checkbox(
+                label="Use previously tracked video instead of tracking",
+                value=False,
+                elem_id="my-btn"
+            )
+
+            with gr.Column(visible=True) as tracking_section:
+                timeline_ruler = gr.HTML("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", elem_id="my-btn")
+                with gr.Row(elem_id="my-btn"):
+                    start_time_slider = gr.Slider(minimum=0, maximum=60, value=0, step=0.5, label="Start Time (s)")
+                    end_time_slider = gr.Slider(minimum=0, maximum=60, value=10, step=0.5, label="End Time (s)")
+                with gr.Row(elem_id="my-btn"):
+                    track_btn = gr.Button("Tracking")
+                    stop_track_btn = gr.Button("Stop Tracking", variant="stop")
+                    static_object_checkbox = gr.Checkbox(label="Static Object", value=False)
+
+            with gr.Column(visible=False) as upload_tracked_section:
+                tracked_video_upload = gr.Video(label="Previously Tracked Video", elem_id="my-video", height=200)
+                load_tracked_btn = gr.Button("Load Tracked Video", elem_id="my-btn")
+
+            video_output = gr.Video(label="Tracking Result", elem_id="my-video", height=300)
+
+            def toggle_tracking_mode(use_tracked):
+                return gr.update(visible=not use_tracked), gr.update(visible=use_tracked)
+
+            use_tracked_checkbox.change(
+                toggle_tracking_mode,
+                inputs=[use_tracked_checkbox],
+                outputs=[tracking_section, upload_tracked_section]
+            )
+
+            with gr.Column(elem_id="my-btn"):
+                dilation_slider = gr.Slider(
+                    minimum=1, maximum=20, value=6, step=1,
+                    label="Mask Dilation",
+                    info="Expands the removal mask outward by this many pixels before inpainting. Recommended: 4–8."
+                )
+
             with gr.Row(elem_id="my-btn"):
-                track_btn = gr.Button("Tracking")
-                static_object_checkbox = gr.Checkbox(
-                    label="Static Object",
-                    value=False,
-                    info="Check if the object doesn't move in the video. Skips SAM2 tracking entirely and tiles the frame-0 mask across all frames — near-instant."
+                inpaint_mode_dropdown = gr.Dropdown(
+                    choices=inpaint_modes,
+                    value=inpaint_modes[0],
+                    label="Processing Mode"
+                )
+            
+            with gr.Column(elem_id="my-btn", visible=False) as telea_options:
+                telea_radius_slider = gr.Slider(minimum=1, maximum=40, value=15, step=1, label="OpenCV Inpaint Radius")
+            with gr.Column(elem_id="my-btn", visible=False) as color_options:
+                mask_color_picker = gr.ColorPicker(label="Mask Color", value="#000000")
+            with gr.Column(elem_id="my-btn", visible=False) as bg_video_options:
+                gr.Markdown("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to replace the masked object/background.</div>")
+                bg_video_upload = gr.Video(label="Background Video", elem_id="my-video", height=300)
+            with gr.Column(elem_id="my-btn", visible=False) as bg_image_options:
+                gr.Markdown("<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload an image to replace the masked object/background.</div>")
+                bg_image_upload = gr.Image(label="Background Image", type="filepath", elem_id="my-video", height=300)
+
+            def toggle_options(mode):
+                return (
+                    gr.update(visible=(mode in ("Fast (OpenCV Telea)", "Fast (OpenCV NS)"))),
+                    gr.update(visible=(mode == "Solid Color")),
+                    gr.update(visible=(mode == "Video Background")),
+                    gr.update(visible=(mode == "Image Background"))
                 )
 
-        with gr.Column(visible=False) as upload_tracked_section:
-            tracked_video_upload = gr.Video(label="Previously Tracked Video", elem_id="my-video", height=200)
-            load_tracked_btn = gr.Button("Load Tracked Video", elem_id="my-btn")
+            inpaint_mode_dropdown.change(
+                toggle_options,
+                inputs=[inpaint_mode_dropdown],
+                outputs=[telea_options, color_options, bg_video_options, bg_image_options]
+            )
 
-        video_output = gr.Video(label="Tracking Result", elem_id="my-video", height=300)
+            with gr.Row(elem_id="my-btn"):
+                remove_btn = gr.Button(btn_label)
+                stop_remove_btn = gr.Button("Stop Process", variant="stop")
+            remove_video = gr.Video(label="Output Results", elem_id="my-video", height=300)
+            
+            with gr.Row(elem_id="my-btn"):
+                download_btn = gr.DownloadButton("Download Output Video", interactive=False)
+            
+            def enable_download(video):
+                if video:
+                    return gr.update(value=video, interactive=True)
+                return gr.update(interactive=False)
 
-        def toggle_tracking_mode(use_tracked):
-            return gr.update(visible=not use_tracked), gr.update(visible=use_tracked)
+            remove_event = remove_btn.click(
+                inference_and_return_video,
+                inputs=[dilation_slider, inpaint_mode_dropdown, telea_radius_slider, mask_color_picker, bg_video_upload, bg_image_upload, video_state],
+                outputs=remove_video
+            ).then(
+                fn=enable_download,
+                inputs=[remove_video],
+                outputs=[download_btn]
+            )
+            stop_remove_btn.click(fn=None, cancels=[remove_event])
+            
+            get_info_btn.click(
+                fn=get_video_info,
+                inputs=[video_input, current_time_box, video_state],
+                outputs=[image_output, image_editor],
+                js=f"(vp, t, vs) => [vp, (document.querySelector('#my-video1-{tab_id} video')?.currentTime ?? 0), vs]"
+            )
+            video_input.change(
+                get_video_duration,
+                inputs=[video_input],
+                outputs=[start_time_slider, end_time_slider, timeline_ruler]
+            )
+            image_output.select(fn=segment_frame, inputs=[point_prompt, video_state, mask_color_picker], outputs=[image_output, mask_color_picker])
+            clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
+            track_event = track_btn.click(track_video, inputs=[start_time_slider, end_time_slider, static_object_checkbox, selection_mode, mask_data_input, video_state], outputs=video_output)
+            stop_track_btn.click(fn=None, cancels=[track_event])
+            load_tracked_btn.click(
+                load_tracked_video,
+                inputs=[video_input, tracked_video_upload, video_state],
+                outputs=[video_output, video_state]
+            )
 
-        use_tracked_checkbox.change(
-            toggle_tracking_mode,
-            inputs=[use_tracked_checkbox],
-            outputs=[tracking_section, upload_tracked_section]
+        return {
+            "video_state": video_state,
+            "video_input": video_input,
+            "image_output": image_output,
+            "image_editor": image_editor,
+            "mask_data_input": mask_data_input,
+            "video_output": video_output,
+            "tracked_video_upload": tracked_video_upload,
+            "remove_video": remove_video,
+            "start_time_slider": start_time_slider,
+            "end_time_slider": end_time_slider,
+            "timeline_ruler": timeline_ruler,
+            "download_btn": download_btn,
+            "static_object_checkbox": static_object_checkbox,
+            "use_tracked_checkbox": use_tracked_checkbox,
+            "tracking_section": tracking_section,
+            "upload_tracked_section": upload_tracked_section,
+        }
+
+with gr.Blocks() as demo:
+    gr.Markdown(f"<div style='text-align:center;'>{text}</div>")
+    
+    reset_btn = gr.Button("Reset Everything", elem_id="reset-btn", variant="stop")
+
+    demo.css = """
+    #my-btn { width: 60% !important; margin: 0 auto; }
+    [id^='my-video1'] { width: 60% !important; max-height: 280px !important; margin: 0 auto; }
+    [id^='my-video1'] video { max-height: 240px !important; object-fit: contain !important; }
+    #my-video { width: 60% !important; max-height: 320px !important; margin: 0 auto; }
+    #my-video video, #my-video img { max-height: 260px !important; object-fit: contain !important; }
+    #my-md { margin: 0 auto; }
+    #my-btn2 { width: 60% !important; margin: 0 auto; }
+    #reset-btn { width: 60% !important; margin: 8px auto !important; display: block !important; }
+    #my-btn2 button { width: 120px !important; max-width: 120px !important; min-width: 120px !important; height: 70px !important; max-height: 70px !important; min-height: 70px !important; margin: 8px !important; border-radius: 8px !important; overflow: hidden !important; white-space: normal !important; }
+    video::-webkit-media-controls-timeline { height: 10px !important; padding: 0 !important; }
+    .video-container input[type=range], video ~ * input[type=range] { height: 10px !important; cursor: pointer !important; }
+    input[type=range]::-webkit-slider-runnable-track { height: 8px !important; border-radius: 4px !important; }
+    input[type=range]::-webkit-slider-thumb { width: 10px !important; height: 28px !important; margin-top: -10px !important; border-radius: 3px !important; background: white !important; border: 1px solid #ccc !important; box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important; cursor: pointer !important; }
+    input[type=range]::-moz-range-thumb { width: 10px !important; height: 28px !important; border-radius: 3px !important; background: white !important; border: 1px solid #ccc !important; box-shadow: 0 1px 4px rgba(0,0,0,0.4) !important; cursor: pointer !important; }
+    """
+
+    with gr.Tabs():
+        tab1_components = build_tab(
+            tab_id="tab1",
+            tab_label="Remove Object",
+            inpaint_modes=["LaMa (PyTorch)", "LaMa ONNX (faster CPU)", "Fast (OpenCV Telea)", "Fast (OpenCV NS)", "GPU (MiniMax-Remover)"],
+            btn_label="Remove Object",
+            desc_info="Upload a video → pause at the frame with the object → click <i>Extract Current Frame</i> → click the object in the image → adjust Start/End time → click <i>Tracking</i> → click <i>Remove Object</i>"
         )
-
-        with gr.Column(elem_id="my-btn"):
-            dilation_slider = gr.Slider(
-                minimum=1, maximum=20, value=6, step=1,
-                label="Mask Dilation",
-                info="Expands the removal mask outward by this many pixels before inpainting. Higher values cover more area around the object's edges (good for fuzzy or moving edges), but may remove too much background. Recommended: 4–8. No impact on speed or RAM."
-            )
-
-        with gr.Row(elem_id="my-btn"):
-            inpaint_mode_dropdown = gr.Dropdown(
-                choices=["LaMa (PyTorch)", "LaMa ONNX (faster CPU)", "Fast (OpenCV Telea)", "Fast (OpenCV NS)", "GPU (MiniMax-Remover)"],
-                value="LaMa (PyTorch)",
-                label="Inpainting Mode",
-                info="LaMa (PyTorch): best CPU quality, good for any background. LaMa ONNX: same quality as LaMa, ~2-4x faster on CPU. OpenCV Telea: instant, best for thin/small objects on uniform backgrounds. OpenCV NS: slightly better than Telea for larger objects, still instant. GPU (MiniMax-Remover): highest quality overall, requires CUDA."
-            )
-        with gr.Column(elem_id="my-btn", visible=False) as telea_options:
-            telea_radius_slider = gr.Slider(
-                minimum=1, maximum=40, value=15, step=1,
-                label="OpenCV Inpaint Radius",
-                info="Only applies to OpenCV Telea and NS modes. Larger values sample from a wider neighbourhood — helps with bigger objects but can blur edges. Try 10–20 for mic-sized objects."
-            )
-
-        def toggle_telea_options(mode):
-            return gr.update(visible=(mode in ("Fast (OpenCV Telea)", "Fast (OpenCV NS)")))
-
-        inpaint_mode_dropdown.change(
-            toggle_telea_options,
-            inputs=[inpaint_mode_dropdown],
-            outputs=[telea_options]
-        )
-        remove_btn = gr.Button("Remove", elem_id="my-btn")
-        remove_video = gr.Video(label="Remove Results", elem_id="my-video", height=300)
         
-        with gr.Row(elem_id="my-btn"):
-            download_btn = gr.DownloadButton("Download Output Video", interactive=False)
+        tab2_components = build_tab(
+            tab_id="tab2",
+            tab_label="Replace Background",
+            inpaint_modes=["Solid Color", "Video Background", "Image Background"],
+            btn_label="Replace Background",
+            desc_info="Upload a video → pause at the frame with the background → click <i>Extract Current Frame</i> → click the background in the image → click <i>Tracking</i> → choose mode and click <i>Replace Background</i>"
+        )
+
+    def reset_all():
+        fresh_state = {"origin_images": None, "inference_state": None, "masks": None, "painted_images": None, "video_path": None, "input_points": [], "scaled_points": [], "input_labels": [], "frame_idx": 0, "obj_id": 1}
+        return (
+            fresh_state, None, None, None, "", None, None, None, gr.update(value=0, maximum=60), gr.update(value=10, maximum=60), "<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", gr.update(interactive=False), False, False, gr.update(visible=True), gr.update(visible=False),
+            fresh_state, None, None, None, "", None, None, None, gr.update(value=0, maximum=60), gr.update(value=10, maximum=60), "<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>", gr.update(interactive=False), False, False, gr.update(visible=True), gr.update(visible=False)
+        )
+
+    reset_btn.click(
+        fn=reset_all,
+        inputs=[],
+        outputs=[
+            tab1_components["video_state"], tab1_components["video_input"], tab1_components["image_output"], tab1_components["image_editor"], tab1_components["mask_data_input"], tab1_components["video_output"], tab1_components["tracked_video_upload"], tab1_components["remove_video"], tab1_components["start_time_slider"], tab1_components["end_time_slider"], tab1_components["timeline_ruler"], tab1_components["download_btn"], tab1_components["static_object_checkbox"], tab1_components["use_tracked_checkbox"], tab1_components["tracking_section"], tab1_components["upload_tracked_section"],
+            tab2_components["video_state"], tab2_components["video_input"], tab2_components["image_output"], tab2_components["image_editor"], tab2_components["mask_data_input"], tab2_components["video_output"], tab2_components["tracked_video_upload"], tab2_components["remove_video"], tab2_components["start_time_slider"], tab2_components["end_time_slider"], tab2_components["timeline_ruler"], tab2_components["download_btn"], tab2_components["static_object_checkbox"], tab2_components["use_tracked_checkbox"], tab2_components["tracking_section"], tab2_components["upload_tracked_section"]
+        ],
+        js="() => { localStorage.removeItem('minimax_tr'); localStorage.removeItem('minimax_rm'); }"
+    )
+
+    gr.HTML("""
+    <script>
+    (function() {
+        function attachZoom(el) {
+            if (el._zoomAttached) return;
+            el._zoomAttached = true;
+            el._zoomScale = 1;
+            el._zoomOriginX = 50;
+            el._zoomOriginY = 50;
+            el.style.transition = 'transform 0.08s ease';
+            el.style.cursor = 'zoom-in';
+
+            const parent = el.closest('.wrap, .image-container, figure, .video-container') || el.parentElement;
+            if (parent) parent.style.overflow = 'hidden';
+
+            el.addEventListener('wheel', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const rect = el.getBoundingClientRect();
+                const mouseX = ((e.clientX - rect.left) / rect.width) * 100;
+                const mouseY = ((e.clientY - rect.top) / rect.height) * 100;
+
+                const isPinch = e.ctrlKey;
+                const factor = e.deltaY < 0 ? (isPinch ? 1.04 : 1.12) : (isPinch ? 0.96 : 0.89);
+                const next = Math.min(Math.max(el._zoomScale * factor, 1), 8);
+
+                if (next > el._zoomScale) {
+                    el._zoomOriginX = mouseX;
+                    el._zoomOriginY = mouseY;
+                }
+
+                el._zoomScale = next;
+                el.style.transformOrigin = el._zoomOriginX + '% ' + el._zoomOriginY + '%';
+                el.style.transform = next === 1 ? '' : 'scale(' + next + ')';
+                el.style.cursor = next > 1 ? 'zoom-out' : 'zoom-in';
+            }, { passive: false });
+
+            el.addEventListener('dblclick', function() {
+                el._zoomScale = 1;
+                el.style.transform = '';
+                el.style.transformOrigin = '50% 50%';
+                el.style.cursor = 'zoom-in';
+            });
+        }
+
+        function scanAndAttach() {
+            document.querySelectorAll('video, .gradio-image img, .image-container img, [data-testid="image"] img, img.svelte-image').forEach(el => {
+                if(el.closest('.my-editor-class') || el.tagName.toLowerCase() === 'canvas') return;
+                attachZoom(el);
+            });
+        }
+
+        scanAndAttach();
+        new MutationObserver(scanAndAttach).observe(document.body, { childList: true, subtree: true });
         
-        # localStorage restore is intentionally removed for all video components.
-        # Gradio validates every file path fed into a component against its internal
-        # temp dir (/tmp/gradio). Both upload paths (Gradio temp, cleaned on restart)
-        # and output paths (STORAGE_DIR) fail that check when restored from localStorage,
-        # causing a ValueError before any Python code runs.
-        def enable_download(video):
-            if video:
-                return gr.update(value=video, interactive=True)
-            return gr.update(interactive=False)
-
-        remove_btn.click(
-            inference_and_return_video,
-            inputs=[dilation_slider, inpaint_mode_dropdown, telea_radius_slider, video_state],
-            outputs=remove_video
-        ).then(
-            fn=enable_download,
-            inputs=[remove_video],
-            outputs=[download_btn]
-        )
-        get_info_btn.click(
-            fn=get_video_info,
-            inputs=[video_input, current_time_box, video_state],
-            outputs=image_output,
-            js="(vp, t, vs) => [vp, (document.querySelector('#my-video1 video')?.currentTime ?? 0), vs]"
-        )
-        video_input.change(
-            get_video_duration,
-            inputs=[video_input],
-            outputs=[start_time_slider, end_time_slider, timeline_ruler]
-        )
-        image_output.select(fn=segment_frame, inputs=[point_prompt, video_state], outputs=image_output)
-        clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
-        track_btn.click(track_video, inputs=[start_time_slider, end_time_slider, static_object_checkbox, video_state], outputs=video_output)
-        load_tracked_btn.click(
-            load_tracked_video,
-            inputs=[video_input, tracked_video_upload, video_state],
-            outputs=[video_output, video_state]
-        )
-
-        def reset_all():
-            fresh_state = {
-                "origin_images": None,
-                "inference_state": None,
-                "masks": None,
-                "painted_images": None,
-                "video_path": None,
-                "input_points": [],
-                "scaled_points": [],
-                "input_labels": [],
-                "frame_idx": 0,
-                "obj_id": 1
-            }
-            return (
-                fresh_state,          # video_state
-                None,                 # video_input
-                None,                 # image_output
-                None,                 # video_output
-                None,                 # tracked_video_upload
-                None,                 # remove_video
-                gr.update(value=0, maximum=60),   # start_time_slider
-                gr.update(value=10, maximum=60),  # end_time_slider
-                "<div style='color:#aaa;font-size:12px;padding:6px 0'>Upload a video to see the timeline ruler.</div>",  # timeline_ruler
-                gr.update(interactive=False),     # download_btn
-                False,                # static_object_checkbox
-                False,                # use_tracked_checkbox
-                gr.update(visible=True),   # tracking_section
-                gr.update(visible=False),  # upload_tracked_section
-            )
-
-        reset_btn.click(
-            fn=reset_all,
-            inputs=[],
-            outputs=[video_state, video_input, image_output, video_output, tracked_video_upload, remove_video,
-                     start_time_slider, end_time_slider, timeline_ruler, download_btn, static_object_checkbox,
-                     use_tracked_checkbox, tracking_section, upload_tracked_section],
-            js="() => { localStorage.removeItem('minimax_tr'); localStorage.removeItem('minimax_rm'); }"
-        )
+        // Polygon Drawing Logic
+        let pts = [];
+        let canvas = null;
+        let ctx = null;
+        let maskCanvas = null;
+        let maskCtx = null;
+        
+        function setupEditor() {
+            document.querySelectorAll('#my-editor-video').forEach(editorContainer => {
+                if(editorContainer.dataset.polygonSetup) return;
+                
+                const img = editorContainer.querySelector('img');
+                if(!img || !img.complete || img.naturalWidth === 0) return; // Wait for image to load
+                
+                editorContainer.dataset.polygonSetup = "true";
+                
+                const drawCanvas = document.createElement('canvas');
+                drawCanvas.style.position = 'absolute';
+                drawCanvas.style.top = '0';
+                drawCanvas.style.left = '0';
+                drawCanvas.style.width = '100%';
+                drawCanvas.style.height = '100%';
+                drawCanvas.style.pointerEvents = 'auto'; 
+                drawCanvas.style.cursor = 'crosshair';
+                drawCanvas.style.zIndex = '1000';
+                
+                const mCanvas = document.createElement('canvas');
+                const mCtx = mCanvas.getContext('2d');
+                
+                editorContainer.style.position = 'relative';
+                const imgParent = img.parentElement;
+                imgParent.style.position = 'relative';
+                imgParent.appendChild(drawCanvas);
+                
+                const drawCtx = drawCanvas.getContext('2d');
+                
+                drawCanvas.addEventListener('mousedown', (e) => {
+                    if(drawCanvas.width !== img.naturalWidth) {
+                        drawCanvas.width = img.naturalWidth;
+                        drawCanvas.height = img.naturalHeight;
+                        mCanvas.width = img.naturalWidth;
+                        mCanvas.height = img.naturalHeight;
+                        drawCanvas.dataset.imgSrc = img.src;
+                    }
+                    
+                    const rect = drawCanvas.getBoundingClientRect();
+                    const scaleX = drawCanvas.width / rect.width;
+                    const scaleY = drawCanvas.height / rect.height;
+                    
+                    const x = (e.clientX - rect.left) * scaleX;
+                    const y = (e.clientY - rect.top) * scaleY;
+                    
+                    if(pts.length > 2) {
+                        const dx = x - pts[0].x;
+                        const dy = y - pts[0].y;
+                        if(Math.sqrt(dx*dx + dy*dy) < 20 * scaleX) {
+                            pts.push({...pts[0]});
+                            
+                            mCtx.fillStyle = 'rgba(0, 255, 0, 0.5)';
+                            mCtx.beginPath();
+                            mCtx.moveTo(pts[0].x, pts[0].y);
+                            for(let i=1; i<pts.length; i++) mCtx.lineTo(pts[i].x, pts[i].y);
+                            mCtx.closePath();
+                            mCtx.fill();
+                            
+                            const b64 = mCanvas.toDataURL('image/png');
+                            // Find the corresponding hidden input
+                            // We need to find the correct text area
+                            const root = editorContainer.closest('.wrap') || document;
+                            const inputs = document.querySelectorAll('#mask-data-input textarea');
+                            // We might have two tabs, so we find the one currently visible or just set both
+                            inputs.forEach(input => {
+                                input.value = b64;
+                                input.dispatchEvent(new Event('input', {bubbles: true}));
+                            });
+                            
+                            pts = [];
+                            draw();
+                            return;
+                        }
+                    }
+                    
+                    pts.push({x, y});
+                    draw();
+                });
+                
+                drawCanvas.addEventListener('mousemove', (e) => {
+                    if(pts.length === 0) return;
+                    const rect = drawCanvas.getBoundingClientRect();
+                    const scaleX = drawCanvas.width / rect.width;
+                    const scaleY = drawCanvas.height / rect.height;
+                    const x = (e.clientX - rect.left) * scaleX;
+                    const y = (e.clientY - rect.top) * scaleY;
+                    draw(x, y);
+                });
+                
+                function draw(mouseX, mouseY) {
+                    drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+                    drawCtx.drawImage(mCanvas, 0, 0);
+                    
+                    if(pts.length > 0) {
+                        drawCtx.setLineDash([5, 5]);
+                        drawCtx.lineWidth = 2 * (drawCanvas.width / drawCanvas.getBoundingClientRect().width);
+                        drawCtx.strokeStyle = '#00FF00';
+                        drawCtx.beginPath();
+                        drawCtx.moveTo(pts[0].x, pts[0].y);
+                        for(let i=1; i<pts.length; i++) {
+                            drawCtx.lineTo(pts[i].x, pts[i].y);
+                        }
+                        if(mouseX !== undefined) {
+                            drawCtx.lineTo(mouseX, mouseY);
+                        }
+                        drawCtx.stroke();
+                        
+                        drawCtx.setLineDash([]);
+                        for(let p of pts) {
+                            drawCtx.beginPath();
+                            drawCtx.arc(p.x, p.y, 4 * (drawCanvas.width / drawCanvas.getBoundingClientRect().width), 0, Math.PI*2);
+                            drawCtx.fillStyle = '#00FF00';
+                            drawCtx.fill();
+                        }
+                    }
+                }
+                
+                // Monitor image changes
+                const observer = new MutationObserver(() => {
+                    if (img.src && drawCanvas.dataset.imgSrc !== img.src) {
+                        drawCanvas.dataset.imgSrc = img.src;
+                        drawCanvas.width = img.naturalWidth;
+                        drawCanvas.height = img.naturalHeight;
+                        mCanvas.width = img.naturalWidth;
+                        mCanvas.height = img.naturalHeight;
+                        drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+                        mCtx.clearRect(0, 0, mCanvas.width, mCanvas.height);
+                        pts = [];
+                        const inputs = document.querySelectorAll('#mask-data-input textarea');
+                        inputs.forEach(input => {
+                            input.value = '';
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                        });
+                    }
+                });
+                observer.observe(img, { attributes: true, attributeFilter: ['src'] });
+            });
+        }
+        
+        setInterval(setupEditor, 500);
+    })();
+    </script>
+    """)
 
 demo.launch(server_name="0.0.0.0", server_port=8000, allowed_paths=["/tmp", os.path.abspath(STORAGE_DIR)], share=True)

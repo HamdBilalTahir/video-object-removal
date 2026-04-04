@@ -6,6 +6,7 @@
 
 import sys
 from hydra import initialize
+from hydra.core.global_hydra import GlobalHydra
 
 from .build_sam import load_model
 
@@ -14,4 +15,5 @@ if '__main__' not in sys.modules:
     import builtins
     sys.modules['__main__'] = builtins
 
-initialize("configs", version_base="1.2")
+if not GlobalHydra.instance().is_initialized():
+    initialize("configs", version_base="1.2")
